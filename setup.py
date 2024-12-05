@@ -21,13 +21,13 @@ assert sys.version_info >= (3,), "This package requires Python 3."
 
 requirements = [
     "emukit",
-    "GPy",
+    "tensorflow>=2.0.0",
+    "tensorflow-probability",
     "graphviz",
     "matplotlib",
     "networkx",
     "numpy",
     "pandas",
-    "paramz",
     "pygraphviz",
     "scikit_learn",
     "scipy",

@@ -2,10 +2,6 @@ from typing import Callable
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
-
-# Enable NumPy behavior in TensorFlow
-tf.experimental.numpy.experimental_enable_numpy_behavior()
-
 from dcbo.bases.root import Root
 from dcbo.bayes_opt.causal_kernels import CausalRBF
 from dcbo.bayes_opt.intervention_computations import evaluate_acquisition_function
@@ -87,9 +83,8 @@ class CBO(Root):
         self.sample_anchor_points = sample_anchor_points
         self.seed_anchor_points = seed_anchor_points
         
-        # Fit Gaussian processes to emissions
+        # Fit Gaussian processes to emissions using TFP
         self.sem_emit_fncs = fit_arcs(self.G, self.observational_samples, emissions=True)
-        # Convert observational samples to dict of temporal lists
         self.observational_samples = convert_to_dict_of_temporal_lists(self.observational_samples)
 
     def _update_bo_model(
@@ -101,21 +96,20 @@ class CBO(Root):
         assert self.interventional_data_y[temporal_index][exploration_set] is not None
 
         input_dim = len(exploration_set)
-        # Convert to numpy first, then to tensor to ensure compatibility
-        X = tf.convert_to_tensor(np.array(self.interventional_data_x[temporal_index][exploration_set]), dtype=tf.float32)
-        Y = tf.convert_to_tensor(np.array(self.interventional_data_y[temporal_index][exploration_set]), dtype=tf.float32)
+        X = tf.convert_to_tensor(self.interventional_data_x[temporal_index][exploration_set], dtype=tf.float32)
+        Y = tf.convert_to_tensor(self.interventional_data_y[temporal_index][exploration_set], dtype=tf.float32)
 
-        # Create mean function wrapper with numpy compatibility
+        # Create mean function wrapper
         mean_fn = lambda x: tf.convert_to_tensor(
-            np.array(self.mean_function[temporal_index][exploration_set](x)), 
+            self.mean_function[temporal_index][exploration_set](x), 
             dtype=tf.float32
         )
 
-        # Set random seed for reproducibility
+        # Set random seed
         tf.random.set_seed(self.seed)
 
         if temporal_index > 0 and isinstance(self.n_obs_t, list) and self.n_obs_t[temporal_index] == 1:
-            # Standard RBF kernel (same as GPy's RBF)
+            # Standard RBF kernel
             kernel = tfk.ExponentiatedQuadratic(
                 amplitude=tf.Variable(1.0, dtype=tf.float32),
                 length_scale=tf.Variable(1.0, dtype=tf.float32)
@@ -124,24 +118,22 @@ class CBO(Root):
             # Causal kernel with variance adjustment
             kernel = CausalRBF(
                 input_dim=input_dim,
-                variance_adjustment=lambda x: tf.convert_to_tensor(
-                    np.array(self.variance_function[temporal_index][exploration_set](x)),
-                    dtype=tf.float32
-                ),
+                variance_adjustment=self.variance_function[temporal_index][exploration_set],
                 lengthscale=1.0,
                 variance=1.0,
                 ARD=False
             )
 
-        # Implement hyperparameter prior (equivalent to GPy's Gamma prior)
+        # Create and optimize model
         if self.hp_i_prior:
+            # Implement prior on hyperparameters using TFP's bijectors
             constrain_positive = tfb.Softplus()
-            kernel.variance = tf.Variable(
+            kernel.amplitude = tf.Variable(
                 constrain_positive.forward(1.0), 
                 constraint=constrain_positive
             )
 
-        # Optimize model (equivalent to GPy's optimize)
+        # Optimize model
         optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
         
         def loss_fn():
@@ -151,23 +143,11 @@ class CBO(Root):
                 observation_noise_variance=1e-5,
                 mean_fn=mean_fn
             )
-            return -gp.log_prob(Y)  # Negative log likelihood
+            return -gp.log_prob(Y)
 
-        # Train for 100 iterations (similar to GPy's optimization)
+        # Train for 100 iterations
         for _ in range(100):
-            with tf.GradientTape() as tape:
-                loss = loss_fn()
-            
-            # Get gradients - use the correct attribute names
-            if isinstance(kernel, tfk.ExponentiatedQuadratic):
-                grads = tape.gradient(loss, [kernel.amplitude, kernel.length_scale])
-                trainable_vars = [kernel.amplitude, kernel.length_scale]
-            else:
-                grads = tape.gradient(loss, [kernel.variance, kernel.lengthscale])
-                trainable_vars = [kernel.variance, kernel.lengthscale]
-            
-            # Apply gradients
-            optimizer.apply_gradients(zip(grads, trainable_vars))
+            optimizer.minimize(loss_fn, var_list=[kernel.amplitude, kernel.length_scale])
 
         # Create and store model wrapper
         self.bo_model[temporal_index][exploration_set] = TFPModelWrapper(
@@ -178,17 +158,17 @@ class CBO(Root):
             Y=Y
         )
 
-        # Safe optimization check (same as GPy version)
+        # Safe optimization check
         self._safe_optimization(temporal_index, exploration_set)
 
     def _safe_optimization(self, temporal_index, exploration_set):
-        """Safely optimize the model with multiple restarts (equivalent to GPy's optimize_restarts)"""
+        """Safely optimize the model with multiple restarts"""
         if self.n_restart > 1:
             best_nlml = float("inf")
             best_model = None
             
             for _ in range(self.n_restart):
-                # Random initialization (same as GPy)
+                # Create new model with random initialization
                 kernel = CausalRBF(
                     input_dim=len(exploration_set),
                     variance_adjustment=self.variance_function[temporal_index][exploration_set],
@@ -197,8 +177,8 @@ class CBO(Root):
                     ARD=False
                 )
                 
-                X = tf.convert_to_tensor(self.interventional_data_x[temporal_index][exploration_set], dtype=tf.float32)
-                Y = tf.convert_to_tensor(self.interventional_data_y[temporal_index][exploration_set], dtype=tf.float32)
+                X = self.interventional_data_x[temporal_index][exploration_set]
+                Y = self.interventional_data_y[temporal_index][exploration_set]
                 mean_fn = lambda x: tf.convert_to_tensor(
                     self.mean_function[temporal_index][exploration_set](x), 
                     dtype=tf.float32
@@ -217,15 +197,9 @@ class CBO(Root):
                     return -gp.log_prob(Y)
                 
                 for _ in range(100):
-                    with tf.GradientTape() as tape:
-                        loss = loss_fn()
-                    
-                    # Get gradients
-                    grads = tape.gradient(loss, [kernel.amplitude, kernel.length_scale])
-                    # Apply gradients
-                    optimizer.apply_gradients(zip(grads, [kernel.amplitude, kernel.length_scale]))
+                    optimizer.minimize(loss_fn, var_list=[kernel.variance, kernel.lengthscale])
                 
-                # Keep best model (same as GPy)
+                # Check if this is the best model
                 current_nlml = loss_fn().numpy()
                 if current_nlml < best_nlml:
                     best_nlml = current_nlml
@@ -237,6 +211,7 @@ class CBO(Root):
                         Y=Y
                     )
             
+            # Use the best model found
             if best_model is not None:
                 self.bo_model[temporal_index][exploration_set] = best_model
 
@@ -246,9 +221,11 @@ class CBO(Root):
         for pa in self.sem_emit_fncs[t]:
             xx, yy = self._get_sem_emit_obs(t, pa)
             if xx and yy:
+                # Convert data to tensors
                 X = tf.convert_to_tensor(xx, dtype=tf.float32)
                 Y = tf.convert_to_tensor(yy, dtype=tf.float32)
                 
+                # Create and optimize GP model
                 kernel = tfk.ExponentiatedQuadratic()
                 optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
                 
@@ -260,15 +237,11 @@ class CBO(Root):
                     )
                     return -gp.log_prob(Y)
                 
+                # Optimize
                 for _ in range(100):
-                    with tf.GradientTape() as tape:
-                        loss = loss_fn()
-                    
-                    # Get gradients
-                    grads = tape.gradient(loss, kernel.trainable_variables)
-                    # Apply gradients
-                    optimizer.apply_gradients(zip(grads, kernel.trainable_variables))
+                    optimizer.minimize(loss_fn, var_list=kernel.trainable_variables)
                 
+                # Store updated model
                 self.sem_emit_fncs[t][pa] = TFPModelWrapper(
                     kernel=kernel,
                     mean_function=lambda x: tf.zeros_like(x[..., 0]),
@@ -277,24 +250,6 @@ class CBO(Root):
                     Y=Y
                 )
 
-    def _get_assigned_blanket(self, temporal_index):
-        """Get the assigned blanket for the current temporal index"""
-        if temporal_index > 0:
-            if self.optimal_assigned_blankets is not None:
-                assigned_blanket = self.optimal_assigned_blankets[temporal_index]
-            else:
-                assigned_blanket = self.assigned_blanket
-        else:
-            assigned_blanket = self.assigned_blanket
-        return assigned_blanket
-
-    def _update_interventional_data(self, temporal_index):
-        """Update interventional data based on temporal index"""
-        if temporal_index > 0 and self.concat:
-            for var in self.interventional_data_x[0].keys():
-                self.interventional_data_x[temporal_index][var] = self.interventional_data_x[temporal_index - 1][var]
-                self.interventional_data_y[temporal_index][var] = self.interventional_data_y[temporal_index - 1][var]
-
     def run(self):
         """Main optimization loop"""
         if self.debug_mode:
@@ -302,7 +257,6 @@ class CBO(Root):
 
         # Walk through the graph temporally
         for temporal_index in trange(self.T, desc="Time index"):
-            # Get current target variable
             target = self.all_target_variables[temporal_index]
             _, target_temporal_index = target.split("_")
             assert int(target_temporal_index) == temporal_index
@@ -351,52 +305,20 @@ class CBO(Root):
             # Post-optimization assignments
             self._post_optimisation_assignments(target, temporal_index)
 
-    def _evaluate_acquisition_functions(self, temporal_index, current_best_global_target, it):
-        """Evaluate acquisition functions for all exploration sets"""
-        
-        for es in self.exploration_sets:
-            # Get BO model if available
-            if (
-                self.interventional_data_x[temporal_index][es] is not None
-                and self.interventional_data_y[temporal_index][es] is not None
-            ):
-                bo_model = self.bo_model[temporal_index][es]
+    def _get_assigned_blanket(self, temporal_index):
+        """Get the assigned blanket for the current temporal index"""
+        if temporal_index > 0:
+            if self.optimal_assigned_blankets is not None:
+                assigned_blanket = self.optimal_assigned_blankets[temporal_index]
             else:
-                bo_model = None
-                if isinstance(self.n_obs_t, list) and self.n_obs_t[temporal_index] == 1:
-                    self.mean_function[temporal_index][es] = standard_mean_function
-                    self.variance_function[temporal_index][es] = zero_variance_adjustment
+                assigned_blanket = self.assigned_blanket
+        else:
+            assigned_blanket = self.assigned_blanket
+        return assigned_blanket
 
-            # Set seed for anchor points
-            seed_to_pass = None
-            if self.seed_anchor_points is not None:
-                seed_to_pass = int(self.seed_anchor_points * (temporal_index + 1) * it)
-
-            # Get the parameter space
-            parameter_space = self.intervention_exploration_domain[es]
-
-            try:
-                self.y_acquired[es], self.corresponding_x[es] = evaluate_acquisition_function(
-                    parameter_intervention_domain=parameter_space,  # Pass the ParameterSpace object directly
-                    bo_model=bo_model,
-                    mean_function=self.mean_function[temporal_index][es],
-                    variance_function=self.variance_function[temporal_index][es],
-                    optimal_target_value_at_current_time=current_best_global_target,
-                    exploration_set=es,
-                    cost_functions=self.cost_functions,
-                    task=self.task,
-                    base_target=self.base_target_variable,
-                    dynamic=False,
-                    causal_prior=True,
-                    temporal_index=temporal_index,
-                    previous_variance=1.0,
-                    num_anchor_points=self.num_anchor_points,
-                    sample_anchor_points=self.sample_anchor_points,
-                    seed_anchor_points=seed_to_pass,
-                )
-            except Exception as e:
-                print(f"Error in acquisition function evaluation: {str(e)}")
-                print(f"Parameter space bounds: {parameter_space.get_bounds()}")
-                print(f"Number of anchor points: {self.num_anchor_points}")
-                print(f"Exploration set: {es}")
-                raise e
+    def _update_interventional_data(self, temporal_index):
+        """Update interventional data based on temporal index"""
+        if temporal_index > 0 and self.concat:
+            for var in self.interventional_data_x[0].keys():
+                self.interventional_data_x[temporal_index][var] = self.interventional_data_x[temporal_index - 1][var]
+                self.interventional_data_y[temporal_index][var] = self.interventional_data_y[temporal_index - 1][var]

@@ -15,6 +15,8 @@ def numerical_optimization(acquisition, inputs: ndarray, task: str, exploration_
     _, D = inputs.shape
 
     improvements = acquisition.evaluate(inputs)
+    
+    print(f"improvements shape : {improvements.shape}")
 
     if task == "min":
         idx = argmax(improvements)
