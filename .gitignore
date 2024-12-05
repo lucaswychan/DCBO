@@ -122,3 +122,4 @@ ENV/
 *.tar
 
 dcbo_venv/
+notebooks/
